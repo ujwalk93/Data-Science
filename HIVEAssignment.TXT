@@ -1,0 +1,399 @@
+--------------------------------
+-- It is necessary to add the required jar file before Hive Query Language execution and Table creation 
+--------------------------------
+
+ADD JAR /opt/cloudera/parcels/CDH/lib/hive/lib/hive-hcatalog-core-1.1.0-cdh5.11.2.jar;
+
+--------------------------------
+-- A. Creating table for data processing and quering 
+--------------------------------
+
+create external table if not exists taxidata
+(VendorID INT, tpep_pickup_datetime timestamp, tpep_dropoff_datetime timestamp,
+passenger_count INT, trip_distance DOUBLE,RatecodeID INT,store_and_fwd_flag char(1),
+PULocationID INT,DOLocationID INT,payment_type INT,fare_amount DOUBLE, extra DOUBLE,
+mta_tax DOUBLE,tip_amount DOUBLE,tolls_amount DOUBLE,improvement_surcharge DOUBLE,total_amount DOUBLE
+)
+ROW FORMAT DELIMITED FIELDS TERMINATED BY ','
+LOCATION '/common_folder/nyc_taxi_data/'
+TBLPROPERTIES("skip.header.line.count"="2");
+
+--------------------------------
+-- B. Data Quality Checks (Data Cleaning)
+--------------------------------
+
+-- 1. Query to summarise the number of records of each TPEP provider (VendorID)
+
+Select VendorID, COUNT(*) as num_records FROM taxidata group by VendorID order by VendorID;
+
+--------------------------------
+-- VendorID   num_records
+-- NULL       ID
+-- 1          8447149
+-- 2	      10345930
+
+-- Two NULL records are present. We can discard the same in the next stage before the actual analysis.
+
+-- VendorIDs 1 and 2 provide 8447149 and 10345930 records respectively.
+--------------------------------
+
+-- 2. Check whether the pickup and drop timestamp (year and month) data is consistent
+
+Select VendorID, YEAR(tpep_pickup_datetime) as yr, MONTH(tpep_pickup_datetime) as mth from taxidata group by
+VendorID, YEAR(tpep_pickup_datetime), MONTH(tpep_pickup_datetime) order by VendorID;
+
+Select VendorID, YEAR(tpep_dropoff_datetime) as yr, MONTH(tpep_dropoff_datetime) as mth from taxidata group by
+VendorID, YEAR(tpep_dropoff_datetime), MONTH(tpep_dropoff_datetime) order by VendorID;
+
+----------------------------------------------------------------------------------
+-- There is lot of inconsistent data with respect to year and month as lot of unusual 
+-- values are present. Most of these is provided by VendorID 2.
+-- Data is provided for months other than November and December.
+-- Also, data is provided for years other than 2018.
+-- But, in dropoff timestamp 01-01-2018 can be considered as pickup was on 31-12-2017.
+----------------------------------------------------------------------------------
+
+-- 3. Check for erroneous rows and unusual and inconsistent values in rest of the dataset
+
+Select VendorID, passenger_count as num_passengers from taxidata group by VendorID, passenger_count order by VendorID;
+
+----------------------------------------------------------------------------------
+-- There are unusual and inconsistent values in passenger_count like 0 and 192.
+-- Most of these is provided by VendorID 2.
+----------------------------------------------------------------------------------
+
+Select VendorID, trip_distance as distance from taxidata where trip_distance <= 0.0 group by VendorID, trip_distance order by VendorID;
+
+---------------------------------------------------------------------------------
+-- Two 0 values are present in trip_distance.
+---------------------------------------------------------------------------------
+
+Select VendorID, PULocationID as pickup, DOLocationID as drop from taxidata where PULocationID < 0 and DOLocationID < 0 group by VendorID, PULocationID, DOLocationID order by VendorID;
+
+---------------------------------------------------------------------------------
+-- No unusual (negative) PULocationID and DOLocationID values are present.
+---------------------------------------------------------------------------------
+
+Select VendorID, fare_amount as fare from taxidata where fare_amount <= 0.0 group by VendorID, fare_amount order by VendorID;
+Select VendorID, tip_amount as tip from taxidata where tip_amount < 0.0 group by VendorID, tip_amount order by VendorID;
+Select VendorID, tolls_amount as toll from taxidata where tolls_amount < 0.0 group by VendorID, tolls_amount order by VendorID;
+Select VendorID, total_amount as total from taxidata where total_amount <= 0.0 group by VendorID, total_amount order by VendorID;
+
+----------------------------------------------------------------------------------
+-- There are unusual (negative) values in fare_amount, tips_amount, 
+-- tolls_amount and total_amount. 
+-- Most of these is provided by VendorID 2.
+----------------------------------------------------------------------------------
+
+Select VendorID, RateCodeID, count(*) as num_count from taxidata group by VendorID, RateCodeID order by VendorID;
+
+---------------------------------------------------------------------------------
+-- There are unusual values (for example, 99) in RateCodeID.
+---------------------------------------------------------------------------------
+
+Select VendorID, payment_type, count(*) as num_count from taxidata group by VendorID, payment_type order by VendorID;
+
+---------------------------------------------------------------------------------
+-- No unusual values are present in Payment_type.
+---------------------------------------------------------------------------------
+
+Select VendorID, store_and_fwd_flag, count(*) as num_count from taxidata group by VendorID, store_and_fwd_flag order by VendorID;
+
+---------------------------------------------------------------------------------
+-- No unusual values are present in store_and_fwd_flag.
+---------------------------------------------------------------------------------
+
+Select VendorID, extra as ext from taxidata where extra NOT IN (0,0.5,1) group by VendorID, extra order by VendorID;
+
+----------------------------------------------------------------------------------
+-- There are unusual and negative values in extra. 
+-- Most of these is provided by VendorID 1.
+----------------------------------------------------------------------------------
+
+Select VendorID, mta_tax as mta from taxidata where mta_tax NOT IN (0,0.5) group by VendorID, mta_tax order by VendorID;
+
+----------------------------------------------------------------------------------
+-- There are unusual and negative values in mta_tax.
+-- Most of these is provided by VendorID 1.
+----------------------------------------------------------------------------------
+
+Select VendorID, improvement_surcharge as improv from taxidata where improvement_surcharge NOT IN (0.3) group by VendorID, improvement_surcharge order by VendorID;
+
+----------------------------------------------------------------------------------
+-- There are unusual values in improvement_surcharge.
+-- Most of these is provided by VendorID 2.
+----------------------------------------------------------------------------------
+
+----------------------------- CONCLUSION -----------------------------------------
+-- There are unusual and erroneous data in fare_amount, tips_amount, 
+-- tolls_amount, total_amount, RateCodeID, extra, improvement_surcharge,
+-- mta_tax and passenger_count.
+-- From the above observations , it is clear that VendorID 2 is doing a
+-- bad job in providing most of the records using different columns of the dataset.
+-- As Vendor ID 2 involved most unusual and erroneous values.
+-- One important point involved in cleaning is that the NULL rows present are 
+-- discarded before the actual analysis in the next phase.
+----------------------------------------------------------------------------------
+
+----------------------------------
+-- C. Create a clean partitioned orc table for analysis 
+----------------------------------
+
+-- First drop the table
+
+drop table taxidata_orc;
+
+-- 1. Create the partitioned table
+
+create external table if not exists taxidata_orc
+(VendorID INT, tpep_pickup_datetime timestamp, tpep_dropoff_datetime timestamp,
+passenger_count INT, trip_distance DOUBLE,RatecodeID INT,store_and_fwd_flag char(1),
+PULocationID INT,DOLocationID INT,payment_type INT,fare_amount DOUBLE, extra DOUBLE,
+mta_tax DOUBLE,tip_amount DOUBLE,tolls_amount DOUBLE,improvement_surcharge DOUBLE,
+total_amount DOUBLE
+)
+partitioned by (yr_nyc INT, mth_nyc INT)
+stored as orc location '/user/hive/warehouse/ujwalkiran'
+tblproperties ("orc.compress"="SNAPPY");
+
+-- 2. Ensure paritioning of data
+
+SET hive.exec.max.dynamic.partitions=100000;
+SET hive.exec.max.dynamic.partitions.pernode=100000;
+
+-- 3. Insert required data into the partition table and remove all unusual and erroneous rows
+-- to obtain the clean, orc partitioned table suitable for analysis.
+
+insert overwrite table taxidata_orc partition(yr_nyc,mth_nyc)
+select VendorID, tpep_pickup_datetime, tpep_dropoff_datetime,
+passenger_count, trip_distance, RatecodeID, store_and_fwd_flag,
+PULocationID, DOLocationID, payment_type, fare_amount, extra,
+mta_tax, tip_amount, tolls_amount, improvement_surcharge, total_amount,
+YEAR(tpep_pickup_datetime) as yr_nyc, MONTH(tpep_pickup_datetime) as mth_nyc
+from taxidata 
+where YEAR(tpep_pickup_datetime) = 2017 and MONTH(tpep_pickup_datetime) in (11,12)
+and passenger_count IN (1,2,3,4,5,6) and fare_amount > 0.0 and trip_distance > 0.0
+and tip_amount >= 0.0 and (payment_type IN (1,3,4) or (payment_type IN (2) and tip_amount=0))
+and tolls_amount >= 0 and total_amount > 0 and extra IN (0,0.5,1) and mta_tax IN (0,0.5)
+and improvement_surcharge = 0.3 and trip_distance > 0.0 and VendorID is NOT NULL
+and RateCodeID IN (1,2,3,4,5,6);
+
+----------------------------------
+-- The following assumptions are made in this assignment based on the data dictionary provided.
+-- 1. Data is considered only for the period Nov-Dec 2017.
+-- 2. Drop timestamp 01-01-2018 is considered only if Pickup timestamp is 31-12-2017.
+-- 3. Unusual passenger count values like 0 and 192 are removed.
+-- 4. Rows having negative values of fare_amount, tips_amount, tolls_amount and total_amount
+-- are discarded. So are rows having zero values of fare_amount, total_amount and trip_distance.
+-- 5. Rows having improvement surcharge values other than 0.3 are discarded.
+-- This is because the trips are made after 2015.
+-- 6. Rows having extra values other than 0, 0.5 or 1 and mta_tax values other than 0 and 0.5
+-- are discarded.
+-- 7. Rows having RateCodeID values other than 1 to 6 are discarded.
+-- 8. 0 values for tip_amount and tolls_amount both are considered since they are not 
+-- mandatory components of the total fare amount.
+-- 9. Average speed is calculated in terms of miles per hour as trip_distance is given 
+-- in terms of miles.
+-- 10. Passenger count should not be greater than 6. Such values, if any are discarded.
+-- Only values from 1 to 6 are considered for passenger count.
+-- 11. Tip amount for payment type cash is discarded as mentioned in the data dictionary given.
+-- 12. NULL values in VendorID (if any) are discarded.
+-- 13. Year and month are used for partitioning as data is divided based on whether trips 
+-- happened in Nov 2017 and Dec 2017.
+-- 14. Cancelled and unknown trips are not considered in this analysis.
+-- 15. The average speeds are determined using miles per hour (Mph) for ease of analysis.
+----------------------------------
+
+-- Finding the number of rows in the new data set
+
+select count(*) as num_records from taxidata_orc;
+
+----------------------------------
+-- 18484454 rows are present in the cleaned dataset.
+----------------------------------
+
+----------------------------------
+-- D. Analysis-I
+----------------------------------
+
+-- 1. Comparing the overall average fare per trip for November and December
+
+SELECT mth_nyc, avg(fare_amount) as Average_fare_amount from taxidata_orc GROUP BY mth_nyc ORDER BY mth_nyc;
+
+----------------------------------
+   mth_nyc average_fare_amount
+-- 11	   12.90558866522332
+-- 12	   12.750239566185826
+	   
+-- Average fare per trip for November (12.906) is slightly higher 
+-- as compared to December (12.75).
+----------------------------------
+
+-- 2. Explore the ‘number of passengers per trip’ - how many trips are made by each level of ‘Passenger_count’
+
+SELECT passenger_count, count(*) as No_of_passengers from taxidata_orc GROUP BY passenger_count ORDER BY passenger_count;
+
+----------------------------------
+-- passenger_count no_of_passengers
+-- 1		   13104803
+-- 2		   2786005
+-- 3		   803092
+-- 4		   394709
+-- 5		   868451
+-- 6		   527394
+
+-- passenger_count = 1 has the most number of records (13104803).
+-- Thus, most people prefer travelling solo.
+---------------------------------
+
+-- 3. What is the most preferred mode of payment
+
+SELECT payment_type, count(*) as Payment_count from taxidata_orc GROUP BY payment_type ORDER BY payment_type;
+
+----------------------------------
+-- payment_type	payment_count
+-- 1		12471429
+-- 2		5915737
+-- 3		75785
+-- 4		21327
+
+-- payment_type = 1 has the most number of records (12471429).
+-- Thus, credit card (payment_type 1) is the most preferred type of payment.
+-----------------------------------
+
+-- 4. Finding the average tip paid per trip and comparing the average tip with the 25th, 50th and 75th percentile 
+
+SELECT avg(tip_amount) as Average_tip_amount from taxidata_orc;
+
+---------------------------------
+-- average_tip_amount
+-- 1.8244339032895105
+
+-- The average tip amount is 1.824.
+---------------------------------
+
+SELECT percentile_approx(tip_amount, 0.25) as p25, percentile_approx(tip_amount, 0.5) as p50,
+percentile_approx(tip_amount, 0.75) as p75, avg(tip_amount) as average_tip_amount from taxidata_orc;
+
+----------------------------------
+-- p25  p50		    p75		       average_tip_amount
+-- 0	1.3600000143051147  2.450000047683716  1.8244339032895105
+----------------------------------
+
+----------------------------------
+-- The tip_amount values in 25th, 50th and 75th percentiles
+-- are 0, 1.36 and 2.45 respectively.
+
+-- The ‘average tip’ is not a representative statistic 
+-- (of the central tendency) of ‘tip amount paid’.
+-- This is because, the 'average tip' lies between the 50th and 75th percentiles.
+----------------------------------
+
+-- 5. Finding out what fraction of total trips have an extra charge is levied
+
+SELECT SUM(IF(extra > 0,1,0))/COUNT(*)*100 as Fraction_of_tips_with_extra_charge from taxidata_orc;
+
+----------------------------------
+-- fraction_of_tips_with_extra_charge
+-- 46.13468160866423
+
+-- 46.135% of the trips have extra charge levied.
+----------------------------------
+
+----------------------------------
+-- E. Analysis-II
+----------------------------------
+
+-- 1. Finding the correlation between the number of passengers on any given trip, and the tip paid per trip
+
+SELECT corr(tip_amount, passenger_count) as correlation from taxidata_orc;
+
+----------------------------------
+-- correlation
+-- -0.004672267649772822
+----------------------------------
+
+----------------------------------
+-- Verifying the result obtained using the below formula:
+-- Correlation(x,y) = Covariance(x,y)/(stdev(x)*stdev(y))
+----------------------------------
+
+SELECT covar_pop(tip_amount, passenger_count)/(stddev_pop(tip_amount)*stddev_pop(passenger_count)) as correlation from taxidata_orc;
+
+----------------------------------
+-- Correlation between the number of passengers on any given trip, and the tip paid per trip is -0.0047.
+
+-- Since, the correlation is slightly negative, it shows that as number of passengers increases, the tip
+-- amount paid per trip slightly decreases.
+-- Thus, it is clear that solo travellers pay comparitively more tips per trip.
+----------------------------------
+
+-- 2. Segregating the data into five segments of ‘tip paid’: [0-5), [5-10), [10-15) , [15-20) and >=20. 
+-- Calculating the percentage share of each bucket
+
+SELECT SUM(IF(tip_amount >= 0 AND tip_amount <=5,1,0))/COUNT(*)*100 as bwn0_5,
+SUM(IF(tip_amount >5 AND tip_amount <=10,1,0))/COUNT(*)*100 as bwn5_10,
+SUM(IF(tip_amount >10 AND tip_amount <=15,1,0))/COUNT(*)*100 as bwn10_15,
+SUM(IF(tip_amount >15 AND tip_amount <=20,1,0))/COUNT(*)*100 as bwn15_20,
+SUM(IF(tip_amount >20,1,0))/COUNT(*)*100 as abv20
+from taxidata_orc;
+
+-----------------------------------
+-- bwn0_5	      bwn5_10		 bwn10_15     	     bwn15_20  		  abv20
+-- 93.14545076635751  5.107995075212933	 1.4978208174285266  0.17852840013559504  0.07020494086544292
+
+-- Most of the tip_amount values (93.145%) lie between 0 and 5.
+-----------------------------------
+
+-- 3. Finding out which month has a greater average ‘speed’ - November or December
+
+Select mth_nyc as month, AVG((trip_distance/(unix_timestamp(tpep_dropoff_datetime)-unix_timestamp(tpep_pickup_datetime)))*3600)
+as average_speed from taxidata_orc group by mth_nyc ORDER BY mth_nyc;
+
+-------------------------------------
+-- month  average_speed 
+-- 11	  12.69141975815155
+-- 12	  12.623958986897327
+
+-- Average speed during November 2017 (12.691 mph) is slightly higher 
+-- than during December 2017 (12.624 mph).
+-------------------------------------
+
+-- 4. Analyse the average speed of the most happening days of the year, i.e. 31st December (New year’s eve) 
+-- and 25th December (Christmas) and compare it with the overall average.
+
+Select AVG((trip_distance/(unix_timestamp(tpep_dropoff_datetime)-unix_timestamp(tpep_pickup_datetime)))*3600)
+as overall_average_speed from taxidata_orc;
+
+-------------------------------------
+-- overall_average_speed
+-- 12.657292928195941
+
+-- The overall average speed is 12.66 mph.
+-------------------------------------
+
+select date_format(tpep_pickup_datetime,'dd-MM-yyyy') as most_happening_days,
+AVG(trip_distance/(unix_timestamp(tpep_dropoff_datetime)-unix_timestamp(tpep_pickup_datetime))*3600) as average_speed 
+from taxidata_orc where DAY(tpep_pickup_datetime) in (25,31) and MONTH(tpep_pickup_datetime) = 12 
+and YEAR(tpep_dropoff_datetime) in (2017,2018) 
+group by date_format(tpep_pickup_datetime,'dd-MM-yyyy'); 
+
+------------------------------------
+-- most_happening_days	average_speed
+-- 25-12-2017		16.859392746920904
+-- 31-12-2017		14.070059254656973
+
+-- Clearly, the average speed of the most happening days of the year, i.e. 
+-- 31st December (New year’s eve) (16.859 mph) and 25th December (Christmas)
+-- (14.07 mph) is greater than the overall_average_speed (12.657 mph).
+
+-- The average speed (16.859 mph) was highest for 25th December.
+------------------------------------
+
+------------------------------------
+-- Note: 
+-- 1) 1 hour = 3600 sec.
+-- Hence 1 mile per second = 3600 miles per hour
+-- 2) In queries 3 and 4 of Analysis-II, all the average speeds are calculated
+-- in terms of miles per hour for ease of analysis.
+------------------------------------
